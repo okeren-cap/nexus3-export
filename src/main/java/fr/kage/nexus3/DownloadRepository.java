@@ -19,6 +19,8 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Objects;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -56,7 +58,16 @@ public class DownloadRepository implements Runnable {
     }
 
     public void start() {
+        Instant startTime = Instant.now();
         try {
+            LOGGER.info("================= Nexus 3 Export Start =================");
+            LOGGER.info("Repository URL: {}", url);
+            LOGGER.info("Target Repository: {}", repositoryId);
+            LOGGER.info("Export Path: {}", downloadPath != null ? downloadPath : "(temporary directory will be created)");
+            LOGGER.info("Authentication: {}", authenticate ? "Enabled" : "None");
+            LOGGER.info("Username: {}", authenticate ? username : "(n/a)");
+            LOGGER.info("========================================================");
+
             LOGGER.info("Preparing download path");
             if (downloadPath == null) {
                 downloadPath = Files.createTempDirectory("nexus3");
@@ -96,6 +107,11 @@ public class DownloadRepository implements Runnable {
                     executorService.shutdown();
                 }
             }
+
+            Duration duration = Duration.between(startTime, Instant.now());
+            LOGGER.info("Export completed in {} seconds", duration.toSeconds());
+            LOGGER.info("================== Export Finished =====================");
+
         } catch (IOException | InterruptedException e) {
             LOGGER.error("Error during repository download", e);
         }
@@ -112,7 +128,7 @@ public class DownloadRepository implements Runnable {
         LOGGER.info("Progress update: Downloaded {} assets out of {} found", assetProcessed.get(), assetFound.get());
     }
 
-    private class DownloadAssetsTask implements Runnable {
+        private class DownloadAssetsTask implements Runnable {
 
         private String continuationToken;
 
@@ -136,9 +152,10 @@ public class DownloadRepository implements Runnable {
 
                 LOGGER.info("{} assets retrieved.", assets.getItems().size());
 
-                if (assets.getContinuationToken() != null)
+                if (assets.getContinuationToken() != null) {
                     LOGGER.info("Continuation token found, queuing next batch.");
                     executorService.submit(new DownloadAssetsTask(assets.getContinuationToken()));
+                }
 
                 assetFound.addAndGet(assets.getItems().size());
                 notifyProgress();
