@@ -1,3 +1,15 @@
+package fr.kage.nexus3;
+
+import org.springframework.web.client.RestTemplate;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.util.UriComponentsBuilder;
+
+import java.net.URI;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
+
+
 public class RepositoryLister {
     private final RestTemplate restTemplate;
     private final String url;
