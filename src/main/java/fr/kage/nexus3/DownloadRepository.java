@@ -96,7 +96,7 @@ public class DownloadRepository implements Runnable {
             }
 
             LOGGER.info("Submitting initial task to executor.");
-            executorService.submit(this);
+            executorService.submit(new DownloadRepository.DownloadAssetsTask(null));
 
             while (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
                 if (activeTasks.get() == 0) {
@@ -118,11 +118,53 @@ public class DownloadRepository implements Runnable {
     public void run() {
         checkState(executorService != null, "Executor not initialized");
         LOGGER.info("Running initial download task");
-        executorService.submit(new DownloadAssetsTask(null));
+        executorService.submit(new DownloadRepository.DownloadAssetsTask(null));
     }
 
     void notifyProgress() {
         LOGGER.info("Progress update: Downloaded {} assets out of {} found", assetProcessed.get(), assetFound.get());
+    }
+
+    private class DownloadAssetsTask implements Runnable {
+        private final String continuationToken;
+
+        public DownloadAssetsTask(String continuationToken) {
+            this.continuationToken = continuationToken;
+            activeTasks.incrementAndGet();
+        }
+
+        @Override
+        public void run() {
+            try {
+                UriComponentsBuilder uriBuilder = UriComponentsBuilder.fromHttpUrl(url)
+                        .path("/service/rest/v1/assets")
+                        .queryParam("repository", repositoryId);
+
+                if (continuationToken != null) {
+                    uriBuilder.queryParam("continuationToken", continuationToken);
+                }
+
+                String uri = uriBuilder.build().toUriString();
+                ResponseEntity<Assets> response = restTemplate.getForEntity(uri, Assets.class);
+
+                if (response.getBody() != null && response.getBody().getItems() != null) {
+                    for (Item item : response.getBody().getItems()) {
+                        executorService.submit(new DownloadItemTask(item));
+                        assetFound.incrementAndGet();
+                    }
+
+                    notifyProgress();
+
+                    if (response.getBody().getContinuationToken() != null) {
+                        executorService.submit(new DownloadAssetsTask(response.getBody().getContinuationToken()));
+                    }
+                }
+            } catch (Exception e) {
+                LOGGER.error("Failed to list or submit download tasks", e);
+            } finally {
+                activeTasks.decrementAndGet();
+            }
+        }
     }
 
     private class DownloadItemTask implements Runnable {
