@@ -16,9 +16,7 @@ import java.io.InputStream;
 import java.net.Authenticator;
 import java.net.PasswordAuthentication;
 import java.net.URI;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.nio.file.*;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Objects;
@@ -51,7 +49,7 @@ public class DownloadRepository implements Runnable {
     public DownloadRepository(String url, String repositoryId, String downloadPath, boolean authenticate, String username, String password) {
         this.url = requireNonNull(url);
         this.repositoryId = requireNonNull(repositoryId);
-        this.downloadPath = downloadPath == null ? null : Paths.get(downloadPath);
+        this.downloadPath = downloadPath == null ? null : Paths.get(downloadPath).resolve(repositoryId);
         this.authenticate = authenticate;
         this.username = username;
         this.password = password;
@@ -70,16 +68,15 @@ public class DownloadRepository implements Runnable {
 
             LOGGER.info("Preparing download path");
             if (downloadPath == null) {
-                downloadPath = Files.createTempDirectory("nexus3");
+                downloadPath = Files.createTempDirectory("nexus3").resolve(repositoryId);
                 LOGGER.info("No path specified. Using temporary directory: {}", downloadPath);
-            } else {
-                if (!Files.exists(downloadPath)) {
-                    LOGGER.info("Creating specified download directory: {}", downloadPath);
-                    Files.createDirectories(downloadPath);
-                }
-                if (!Files.isDirectory(downloadPath) || !Files.isWritable(downloadPath)) {
-                    throw new IOException("Not a writable directory: " + downloadPath);
-                }
+            }
+            if (!Files.exists(downloadPath)) {
+                LOGGER.info("Creating specified download directory: {}", downloadPath);
+                Files.createDirectories(downloadPath);
+            }
+            if (!Files.isDirectory(downloadPath) || !Files.isWritable(downloadPath)) {
+                throw new IOException("Not a writable directory: " + downloadPath);
             }
 
             LOGGER.info("Starting download of Nexus 3 repository '{}' into '{}'", repositoryId, downloadPath);
@@ -128,51 +125,6 @@ public class DownloadRepository implements Runnable {
         LOGGER.info("Progress update: Downloaded {} assets out of {} found", assetProcessed.get(), assetFound.get());
     }
 
-        private class DownloadAssetsTask implements Runnable {
-
-        private String continuationToken;
-
-        public DownloadAssetsTask(String continuationToken) {
-            this.continuationToken = continuationToken;
-            activeTasks.incrementAndGet();
-        }
-
-        @Override
-        public void run() {
-            try {
-                LOGGER.info("Requesting assets list{}", continuationToken != null ? " (with continuationToken)" : "");
-                UriComponentsBuilder getAssets = UriComponentsBuilder.fromHttpUrl(url)
-                        .pathSegment("service", "rest", "v1", "assets")
-                        .queryParam("repository", repositoryId);
-                if (continuationToken != null)
-                    getAssets.queryParam("continuationToken", continuationToken);
-
-                ResponseEntity<Assets> assetsEntity = restTemplate.getForEntity(getAssets.build().toUri(), Assets.class);
-                Assets assets = assetsEntity.getBody();
-
-                LOGGER.info("{} assets retrieved.", assets.getItems().size());
-
-                if (assets.getContinuationToken() != null) {
-                    LOGGER.info("Continuation token found, queuing next batch.");
-                    executorService.submit(new DownloadAssetsTask(assets.getContinuationToken()));
-                }
-
-                assetFound.addAndGet(assets.getItems().size());
-                notifyProgress();
-                for (Item item : assets.getItems()) {
-                    LOGGER.info("Queuing download task for asset: {}", item.getPath());
-                    executorService.submit(new DownloadItemTask(item));
-                }
-
-            } catch (Exception e) {
-                LOGGER.error("Asset download failed", e);
-                executorService.shutdownNow();
-            } finally {
-                activeTasks.decrementAndGet();
-            }
-        }
-    }
-
     private class DownloadItemTask implements Runnable {
 
         private Item item;
@@ -186,13 +138,18 @@ public class DownloadRepository implements Runnable {
         public void run() {
             try {
                 LOGGER.info("Downloading asset from: {}", item.getDownloadUrl());
-                Path assetPath = downloadPath.resolve(item.getPath());
+                Path relativeItemPath = Paths.get(item.getPath()).normalize();
+                if (relativeItemPath.isAbsolute()) {
+                    LOGGER.warn("Asset path was absolute. Forcing to relative: {}", relativeItemPath);
+                    relativeItemPath = Paths.get(".").resolve(item.getPath().substring(1)).normalize();
+                }
+                Path assetPath = downloadPath.resolve(relativeItemPath);
                 Files.createDirectories(assetPath.getParent());
                 URI downloadUri = URI.create(item.getDownloadUrl());
                 int tryCount = 1;
                 while (tryCount <= 3) {
                     try (InputStream assetStream = downloadUri.toURL().openStream()) {
-                        Files.copy(assetStream, assetPath);
+                        Files.copy(assetStream, assetPath, StandardCopyOption.REPLACE_EXISTING);
                         HashCode hash = com.google.common.io.Files.asByteSource(assetPath.toFile()).hash(Hashing.sha1());
                         if (Objects.equals(hash.toString(), item.getChecksum().getSha1())) {
                             LOGGER.info("Successfully downloaded and verified: {}", item.getPath());
@@ -200,6 +157,9 @@ public class DownloadRepository implements Runnable {
                         }
                         tryCount++;
                         LOGGER.warn("Checksum mismatch, retrying download for: {}", item.getPath());
+                    } catch (FileAlreadyExistsException e) {
+                        LOGGER.warn("File already exists, skipping: {}", assetPath);
+                        break;
                     }
                 }
                 assetProcessed.incrementAndGet();
