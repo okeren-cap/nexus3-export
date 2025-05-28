@@ -21,28 +21,28 @@ public class Nexus3ExportApplication implements CommandLineRunner {
 
 	@Override
 	public void run(String... args) throws Exception {
-		if (args.length > 0) {
-			if (args.length >= 2) {
-				String url = args[0];
-				String repoId = args[1];
-				String downloadPath = args.length == 3 ? args[2] : null;
+		Properties credentials = loadCredentials();
+		boolean authenticate = Boolean.parseBoolean(credentials.getProperty("authenticate", "false"));
+		String username = removeTrailingQuotes(credentials.getProperty("username"));
+		String password = removeTrailingQuotes(credentials.getProperty("password"));
 
-				Properties credentials = loadCredentials();
-				boolean authenticate = Boolean.valueOf(credentials.getProperty("authenticate", "false"));
-				String username = removeTrailingQuotes(credentials.getProperty("username"));
-				String password = removeTrailingQuotes(credentials.getProperty("password"));
-				new DownloadRepository(url, repoId, downloadPath, authenticate, username, password).start();
-				return;
-			}
-			else
-				System.out.println("Missing arguments for download.");
+		if (args.length == 3) {
+			// Ein einzelnes Repo exportieren
+			String url = args[0];
+			String repoId = args[1];
+			String downloadPath = args[2];
+			new DownloadRepository(url, repoId, downloadPath, authenticate, username, password).start();
+		} else if (args.length == 2) {
+			// Alle Repos exportieren
+			String url = args[0];
+			String basePath = args[1];
+			new DownloadAllRepositories(url, basePath, authenticate, username, password).start();
+		} else {
+			System.out.println("❌ Ungültige Argumente.");
+			System.out.println("▶ Einzelnes Repo: java -jar nexus3-export.jar <url> <repoId> <outputPath>");
+			System.out.println("▶ Alle Repos   : java -jar nexus3-export.jar <url> <outputBasePath>");
+			System.exit(1);
 		}
-		else
-			System.out.println("No specified argument.");
-
-		System.out.println("Usage:");
-		System.out.println("\tnexus3 http://url.to/nexus3 repositoryId [localPath]");
-		System.exit(1);
 	}
 
 	private Properties loadCredentials() {
