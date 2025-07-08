@@ -1,6 +1,4 @@
-// RepositoryList.java
 package fr.kage.nexus3;
-
 import java.util.List;
 
 public class RepositoryList {
