@@ -128,6 +128,11 @@ public class DownloadRepository implements Runnable {
             Duration duration = Duration.between(startTime, Instant.now());
             LOGGER.info("Export completed in {} seconds", duration.toSeconds());
             LOGGER.info("================== Export Finished =====================");
+            
+            // Clear the default authenticator to prevent hanging
+            if (authenticate) {
+                Authenticator.setDefault(null);
+            }
 
         } catch (IOException | InterruptedException e) {
             LOGGER.error("Error during repository download", e);
