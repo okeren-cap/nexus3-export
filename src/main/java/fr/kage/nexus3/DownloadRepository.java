@@ -288,6 +288,15 @@ public class DownloadRepository implements Runnable {
 
                         if (response.getBody() != null && response.getBody().getItems() != null) {
                             int itemCount = response.getBody().getItems().size();
+                            
+                            if (itemCount == 0 && continuationToken == null) {
+                                // This is an empty repository (no items in first batch)
+                                LOGGER.info("Repository '{}' is empty, no assets to download", repositoryId);
+                                continuationTokensProcessed.add(tokenKey);
+                                notifyProgress();
+                                break; // Exit retry loop for empty repo
+                            }
+                            
                             LOGGER.info("Retrieved {} assets in this batch", itemCount);
                             
                             for (Item item : response.getBody().getItems()) {
@@ -310,6 +319,10 @@ public class DownloadRepository implements Runnable {
                                 Thread.sleep(2000); // 2 second delay between batches
                                 executorService.submit(new DownloadAssetsTask(response.getBody().getContinuationToken()));
                             }
+                        } else {
+                            // Empty response body
+                            LOGGER.info("Empty response for repository '{}', batch complete", repositoryId);
+                            continuationTokensProcessed.add(tokenKey);
                         }
                         
                         // Success - break out of retry loop
