@@ -110,11 +110,19 @@ public class DownloadRepository implements Runnable {
             LOGGER.info("Submitting initial task to executor.");
             executorService.submit(new DownloadAssetsTask(null));
 
-            while (!executorService.awaitTermination(10, TimeUnit.SECONDS)) {
-                if (activeTasks.get() == 0) {
-                    LOGGER.info("All download tasks completed. Shutting down executor.");
-                    executorService.shutdown();
-                }
+            // Wait for all tasks to complete
+            while (activeTasks.get() > 0) {
+                LOGGER.debug("Waiting for {} active tasks to complete", activeTasks.get());
+                Thread.sleep(2000);
+            }
+            
+            LOGGER.info("All download tasks completed. Shutting down executor.");
+            executorService.shutdown();
+            
+            // Wait for executor to fully terminate
+            if (!executorService.awaitTermination(30, TimeUnit.SECONDS)) {
+                LOGGER.warn("Executor did not terminate gracefully, forcing shutdown");
+                executorService.shutdownNow();
             }
 
             Duration duration = Duration.between(startTime, Instant.now());
@@ -231,7 +239,7 @@ public class DownloadRepository implements Runnable {
         @Override
         public void run() {
             try {
-                LOGGER.debug("Downloading asset from: {}", item.getDownloadUrl());
+                LOGGER.info("Downloading asset from: {}", item.getDownloadUrl());
                 Path relativeItemPath = Paths.get(item.getPath()).normalize();
                 if (relativeItemPath.isAbsolute()) {
                     LOGGER.warn("Asset path was absolute. Forcing to relative: {}", relativeItemPath);
@@ -244,7 +252,7 @@ public class DownloadRepository implements Runnable {
                     try {
                         HashCode existingHash = com.google.common.io.Files.asByteSource(assetPath.toFile()).hash(Hashing.sha1());
                         if (Objects.equals(existingHash.toString(), item.getChecksum().getSha1())) {
-                            LOGGER.debug("File already exists with correct checksum, skipping: {}", item.getPath());
+                            LOGGER.info("File already exists with correct checksum, skipping: {}", item.getPath());
                             assetProcessed.incrementAndGet();
                             return;
                         }
@@ -261,7 +269,7 @@ public class DownloadRepository implements Runnable {
                         Files.copy(assetStream, assetPath, StandardCopyOption.REPLACE_EXISTING);
                         HashCode hash = com.google.common.io.Files.asByteSource(assetPath.toFile()).hash(Hashing.sha1());
                         if (Objects.equals(hash.toString(), item.getChecksum().getSha1())) {
-                            LOGGER.debug("Successfully downloaded and verified: {}", item.getPath());
+                            LOGGER.info("Successfully downloaded and verified: {}", item.getPath());
                             break;
                         }
                         tryCount++;
