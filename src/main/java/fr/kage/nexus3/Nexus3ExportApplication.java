@@ -26,21 +26,36 @@ public class Nexus3ExportApplication implements CommandLineRunner {
 		String username = removeTrailingQuotes(credentials.getProperty("username"));
 		String password = removeTrailingQuotes(credentials.getProperty("password"));
 
-		if (args.length == 3) {
-			// Ein einzelnes Repo exportieren
-			String url = args[0];
-			String repoId = args[1];
-			String downloadPath = args[2];
+		// Check for --force flag
+		boolean forceRedownload = false;
+		String[] cleanArgs = args;
+		
+		if (args.length > 0 && "--force".equals(args[args.length - 1])) {
+			forceRedownload = true;
+			// Remove --force from args
+			cleanArgs = new String[args.length - 1];
+			System.arraycopy(args, 0, cleanArgs, 0, args.length - 1);
+		}
+
+		if (cleanArgs.length == 3) {
+			// Single repository export
+			String url = cleanArgs[0];
+			String repoId = cleanArgs[1];
+			String downloadPath = cleanArgs[2];
 			new DownloadRepository(url, repoId, downloadPath, authenticate, username, password).start();
-		} else if (args.length == 2) {
-			// Alle Repos exportieren
-			String url = args[0];
-			String basePath = args[1];
-			new DownloadAllRepositories(url, basePath, authenticate, username, password).start();
+		} else if (cleanArgs.length == 2) {
+			// Bulk export all repositories
+			String url = cleanArgs[0];
+			String basePath = cleanArgs[1];
+			new DownloadAllRepositories(url, basePath, authenticate, username, password, forceRedownload).start();
 		} else {
-			System.out.println("❌ Ungültige Argumente.");
-			System.out.println("▶ Einzelnes Repo: java -jar nexus3-export.jar <url> <repoId> <outputPath>");
-			System.out.println("▶ Alle Repos   : java -jar nexus3-export.jar <url> <outputBasePath>");
+			System.out.println("❌ Invalid arguments.");
+			System.out.println("Usage:");
+			System.out.println("▶ Single repository: java -jar nexus3-export.jar <url> <repoId> <outputPath>");
+			System.out.println("▶ All repositories : java -jar nexus3-export.jar <url> <outputBasePath> [--force]");
+			System.out.println("");
+			System.out.println("Options:");
+			System.out.println("  --force    Force re-download of already existing repositories (bulk export only)");
 			System.exit(1);
 		}
 	}

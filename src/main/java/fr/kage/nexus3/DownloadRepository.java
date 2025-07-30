@@ -115,6 +115,10 @@ public class DownloadRepository implements Runnable {
 
             Duration duration = Duration.between(startTime, Instant.now());
             LOGGER.info("Export completed in {} seconds", duration.getSeconds());
+            
+            // Create completion marker to indicate successful export
+            createCompletionMarker();
+            
             LOGGER.info("================== Export Finished =====================");
 
         } catch (IOException | InterruptedException e) {
@@ -131,6 +135,32 @@ public class DownloadRepository implements Runnable {
 
     void notifyProgress() {
         LOGGER.info("Progress update: Downloaded {} assets out of {} found", assetProcessed.get(), assetFound.get());
+    }
+
+    private void createCompletionMarker() {
+        try {
+            Path markerFile = downloadPath.resolve(".nexus-export-complete");
+            String markerContent = String.format(
+                "Export completed successfully at %s%n" +
+                "Repository: %s%n" +
+                "Assets processed: %d%n" +
+                "Assets found: %d%n" +
+                "Nexus URL: %s%n" +
+                "Download path: %s%n" +
+                "Export tool version: nexus3-export-1.0%n",
+                Instant.now().toString(), 
+                repositoryId, 
+                assetProcessed.get(), 
+                assetFound.get(),
+                url,
+                downloadPath.toString()
+            );
+            
+            Files.write(markerFile, markerContent.getBytes());
+            LOGGER.info("✅ Created completion marker with {} assets processed: {}", assetProcessed.get(), markerFile);
+        } catch (IOException e) {
+            LOGGER.warn("Failed to create completion marker (export was successful but resume detection may not work): {}", e.getMessage());
+        }
     }
 
     private class DownloadAssetsTask implements Runnable {
