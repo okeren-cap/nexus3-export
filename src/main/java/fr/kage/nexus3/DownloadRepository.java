@@ -207,9 +207,13 @@ public class DownloadRepository implements Runnable {
 
                     notifyProgress();
 
+                    // Submit continuation task BEFORE decrementing activeTasks to avoid race condition
                     if (response.getBody().getContinuationToken() != null) {
                         executorService.submit(new DownloadAssetsTask(response.getBody().getContinuationToken()));
                     }
+                    
+                    // Now it's safe to decrement since any new continuation task has been submitted
+                    activeTasks.decrementAndGet();
                 }
             } catch (HttpServerErrorException e) {
                 if (attemptNumber < MAX_RETRIES && (e.getRawStatusCode() == 500 || e.getRawStatusCode() == 502 || e.getRawStatusCode() == 503)) {
@@ -221,12 +225,16 @@ public class DownloadRepository implements Runnable {
                     try {
                         Thread.sleep(delayMs);
                         executorService.submit(new DownloadAssetsTask(continuationToken, attemptNumber + 1));
+                        // Decrement here since we're submitting a retry task
+                        activeTasks.decrementAndGet();
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         LOGGER.error("Interrupted while waiting to retry", ie);
+                        activeTasks.decrementAndGet();
                     }
                 } else {
                     LOGGER.error("Failed to list assets after {} attempts. Giving up on this batch.", attemptNumber, e);
+                    activeTasks.decrementAndGet();
                 }
             } catch (Exception e) {
                 if (attemptNumber < MAX_RETRIES) {
@@ -238,15 +246,17 @@ public class DownloadRepository implements Runnable {
                     try {
                         Thread.sleep(delayMs);
                         executorService.submit(new DownloadAssetsTask(continuationToken, attemptNumber + 1));
+                        // Decrement here since we're submitting a retry task
+                        activeTasks.decrementAndGet();
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         LOGGER.error("Interrupted while waiting to retry", ie);
+                        activeTasks.decrementAndGet();
                     }
                 } else {
                     LOGGER.error("Failed to list assets after {} attempts with unexpected error. Giving up on this batch.", attemptNumber, e);
+                    activeTasks.decrementAndGet();
                 }
-            } finally {
-                activeTasks.decrementAndGet();
             }
         }
     }
