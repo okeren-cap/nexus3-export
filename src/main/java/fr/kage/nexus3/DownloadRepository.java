@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.web.client.HttpServerErrorException;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.io.IOException;
@@ -84,7 +85,11 @@ public class DownloadRepository implements Runnable {
 
             if (authenticate) {
                 LOGGER.info("Authentication enabled. Configuring credentials for REST and stream download.");
-                restTemplate = new RestTemplateBuilder().basicAuthentication(username, password).build();
+                restTemplate = new RestTemplateBuilder()
+                        .basicAuthentication(username, password)
+                        .setConnectTimeout(Duration.ofMinutes(2))
+                        .setReadTimeout(Duration.ofMinutes(5))
+                        .build();
                 Authenticator.setDefault(new Authenticator() {
                     protected PasswordAuthentication getPasswordAuthentication() {
                         return new PasswordAuthentication(username, password.toCharArray());
@@ -92,7 +97,10 @@ public class DownloadRepository implements Runnable {
                 });
             } else {
                 LOGGER.info("Authentication not required.");
-                restTemplate = new RestTemplate();
+                restTemplate = new RestTemplateBuilder()
+                        .setConnectTimeout(Duration.ofMinutes(2))
+                        .setReadTimeout(Duration.ofMinutes(5))
+                        .build();
             }
 
             LOGGER.info("Submitting initial task to executor.");
@@ -106,7 +114,7 @@ public class DownloadRepository implements Runnable {
             }
 
             Duration duration = Duration.between(startTime, Instant.now());
-            LOGGER.info("Export completed in {} seconds", duration.toSeconds());
+            LOGGER.info("Export completed in {} seconds", duration.getSeconds());
             LOGGER.info("================== Export Finished =====================");
 
         } catch (IOException | InterruptedException e) {
@@ -127,9 +135,17 @@ public class DownloadRepository implements Runnable {
 
     private class DownloadAssetsTask implements Runnable {
         private final String continuationToken;
+        private final int attemptNumber;
+        private static final int MAX_RETRIES = 5;
+        private static final long BASE_DELAY_MS = 2000;
 
         public DownloadAssetsTask(String continuationToken) {
+            this(continuationToken, 1);
+        }
+
+        public DownloadAssetsTask(String continuationToken, int attemptNumber) {
             this.continuationToken = continuationToken;
+            this.attemptNumber = attemptNumber;
             activeTasks.incrementAndGet();
         }
 
@@ -145,9 +161,14 @@ public class DownloadRepository implements Runnable {
                 }
 
                 String uri = uriBuilder.build().toUriString();
+                LOGGER.info("Attempt {} to fetch assets from: {}", attemptNumber, uri);
+                
                 ResponseEntity<Assets> response = restTemplate.getForEntity(uri, Assets.class);
 
                 if (response.getBody() != null && response.getBody().getItems() != null) {
+                    LOGGER.info("Successfully fetched {} assets on attempt {}", 
+                              response.getBody().getItems().size(), attemptNumber);
+                    
                     for (Item item : response.getBody().getItems()) {
                         executorService.submit(new DownloadItemTask(item));
                         assetFound.incrementAndGet();
@@ -159,8 +180,40 @@ public class DownloadRepository implements Runnable {
                         executorService.submit(new DownloadAssetsTask(response.getBody().getContinuationToken()));
                     }
                 }
+            } catch (HttpServerErrorException e) {
+                if (attemptNumber < MAX_RETRIES && (e.getRawStatusCode() == 500 || e.getRawStatusCode() == 502 || e.getRawStatusCode() == 503)) {
+                    long delayMs = BASE_DELAY_MS * (long) Math.pow(2, attemptNumber - 1);
+                    LOGGER.warn("Attempt {} failed to list/submit download tasks, retrying in {} ms", 
+                              attemptNumber, delayMs);
+                    LOGGER.warn("Error details: {}", e.getMessage());
+                    
+                    try {
+                        Thread.sleep(delayMs);
+                        executorService.submit(new DownloadAssetsTask(continuationToken, attemptNumber + 1));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        LOGGER.error("Interrupted while waiting to retry", ie);
+                    }
+                } else {
+                    LOGGER.error("Failed to list assets after {} attempts. Giving up on this batch.", attemptNumber, e);
+                }
             } catch (Exception e) {
-                LOGGER.error("Failed to list or submit download tasks", e);
+                if (attemptNumber < MAX_RETRIES) {
+                    long delayMs = BASE_DELAY_MS * (long) Math.pow(2, attemptNumber - 1);
+                    LOGGER.warn("Attempt {} failed with unexpected error, retrying in {} ms", 
+                              attemptNumber, delayMs);
+                    LOGGER.warn("Error details: {}", e.getMessage());
+                    
+                    try {
+                        Thread.sleep(delayMs);
+                        executorService.submit(new DownloadAssetsTask(continuationToken, attemptNumber + 1));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        LOGGER.error("Interrupted while waiting to retry", ie);
+                    }
+                } else {
+                    LOGGER.error("Failed to list assets after {} attempts with unexpected error. Giving up on this batch.", attemptNumber, e);
+                }
             } finally {
                 activeTasks.decrementAndGet();
             }
