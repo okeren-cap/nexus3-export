@@ -104,7 +104,12 @@ public class DownloadRepository implements Runnable {
             }
 
             LOGGER.info("Submitting initial task to executor.");
-            executorService.submit(new DownloadRepository.DownloadAssetsTask(null));
+            // Start with Search API for potentially large repositories based on naming patterns
+            boolean useSearchAPI = shouldUseSearchAPIFirst(repositoryId);
+            if (useSearchAPI) {
+                LOGGER.info("Repository '{}' appears to be large, starting with Search API for better performance.", repositoryId);
+            }
+            executorService.submit(new DownloadRepository.DownloadAssetsTask(null, 1, useSearchAPI));
 
             while (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
                 if (activeTasks.get() == 0) {
@@ -126,48 +131,81 @@ public class DownloadRepository implements Runnable {
     public void run() {
         checkState(executorService != null, "Executor not initialized");
         LOGGER.info("Running initial download task");
-        executorService.submit(new DownloadRepository.DownloadAssetsTask(null));
+        boolean useSearchAPI = shouldUseSearchAPIFirst(repositoryId);
+        executorService.submit(new DownloadRepository.DownloadAssetsTask(null, 1, useSearchAPI));
     }
 
     void notifyProgress() {
         LOGGER.info("Progress update: Downloaded {} assets out of {} found", assetProcessed.get(), assetFound.get());
     }
 
+    private boolean shouldUseSearchAPIFirst(String repoId) {
+        // Use Search API first for repositories that are typically large
+        String repoLower = repoId.toLowerCase();
+        return repoLower.contains("central") || 
+               repoLower.contains("public") || 
+               repoLower.contains("proxy") ||
+               repoLower.contains("group") ||
+               repoLower.contains("maven") ||
+               repoLower.contains("npm") ||
+               repoLower.contains("docker") ||
+               repoLower.startsWith("cache") ||
+               repoLower.endsWith("-all") ||
+               repoLower.endsWith("-proxy");
+    }
+
     private class DownloadAssetsTask implements Runnable {
         private final String continuationToken;
         private final int attemptNumber;
+        private final boolean useSearchAPI;
         private static final int MAX_RETRIES = 5;
         private static final long BASE_DELAY_MS = 2000;
 
         public DownloadAssetsTask(String continuationToken) {
-            this(continuationToken, 1);
+            this(continuationToken, 1, false);
         }
 
-        public DownloadAssetsTask(String continuationToken, int attemptNumber) {
+        public DownloadAssetsTask(String continuationToken, int attemptNumber, boolean useSearchAPI) {
             this.continuationToken = continuationToken;
             this.attemptNumber = attemptNumber;
+            this.useSearchAPI = useSearchAPI;
             activeTasks.incrementAndGet();
         }
 
         @Override
         public void run() {
             try {
-                UriComponentsBuilder uriBuilder = UriComponentsBuilder.fromHttpUrl(url)
-                        .path("/service/rest/v1/assets")
-                        .queryParam("repository", repositoryId);
+                String uri;
+                if (useSearchAPI) {
+                    // Use Search API as fallback for large repositories
+                    UriComponentsBuilder uriBuilder = UriComponentsBuilder.fromHttpUrl(url)
+                            .path("/service/rest/v1/search/assets")
+                            .queryParam("repository", repositoryId);
+                    
+                    if (continuationToken != null) {
+                        uriBuilder.queryParam("continuationToken", continuationToken);
+                    }
+                    uri = uriBuilder.build().toUriString();
+                    LOGGER.info("Attempt {} using Search API fallback: {}", attemptNumber, uri);
+                } else {
+                    // Use standard Assets API
+                    UriComponentsBuilder uriBuilder = UriComponentsBuilder.fromHttpUrl(url)
+                            .path("/service/rest/v1/assets")
+                            .queryParam("repository", repositoryId);
 
-                if (continuationToken != null) {
-                    uriBuilder.queryParam("continuationToken", continuationToken);
+                    if (continuationToken != null) {
+                        uriBuilder.queryParam("continuationToken", continuationToken);
+                    }
+                    uri = uriBuilder.build().toUriString();
+                    LOGGER.info("Attempt {} to fetch assets from: {}", attemptNumber, uri);
                 }
-
-                String uri = uriBuilder.build().toUriString();
-                LOGGER.info("Attempt {} to fetch assets from: {}", attemptNumber, uri);
                 
                 ResponseEntity<Assets> response = restTemplate.getForEntity(uri, Assets.class);
 
                 if (response.getBody() != null && response.getBody().getItems() != null) {
-                    LOGGER.info("Successfully fetched {} assets on attempt {}", 
-                              response.getBody().getItems().size(), attemptNumber);
+                    LOGGER.info("Successfully fetched {} assets on attempt {} using {}", 
+                              response.getBody().getItems().size(), attemptNumber, 
+                              useSearchAPI ? "Search API" : "Assets API");
                     
                     for (Item item : response.getBody().getItems()) {
                         executorService.submit(new DownloadItemTask(item));
@@ -177,11 +215,15 @@ public class DownloadRepository implements Runnable {
                     notifyProgress();
 
                     if (response.getBody().getContinuationToken() != null) {
-                        executorService.submit(new DownloadAssetsTask(response.getBody().getContinuationToken()));
+                        executorService.submit(new DownloadAssetsTask(response.getBody().getContinuationToken(), 1, useSearchAPI));
                     }
                 }
             } catch (HttpServerErrorException e) {
-                if (attemptNumber < MAX_RETRIES && (e.getRawStatusCode() == 500 || e.getRawStatusCode() == 502 || e.getRawStatusCode() == 503)) {
+                if (e.getRawStatusCode() == 500 && !useSearchAPI && attemptNumber <= 2) {
+                    // For initial 500 errors, try Search API fallback immediately
+                    LOGGER.warn("Assets API failed with 500 error, switching to Search API fallback");
+                    executorService.submit(new DownloadAssetsTask(continuationToken, 1, true));
+                } else if (attemptNumber < MAX_RETRIES && (e.getRawStatusCode() == 500 || e.getRawStatusCode() == 502 || e.getRawStatusCode() == 503)) {
                     long delayMs = BASE_DELAY_MS * (long) Math.pow(2, attemptNumber - 1);
                     LOGGER.warn("Attempt {} failed to list/submit download tasks, retrying in {} ms", 
                               attemptNumber, delayMs);
@@ -189,13 +231,14 @@ public class DownloadRepository implements Runnable {
                     
                     try {
                         Thread.sleep(delayMs);
-                        executorService.submit(new DownloadAssetsTask(continuationToken, attemptNumber + 1));
+                        executorService.submit(new DownloadAssetsTask(continuationToken, attemptNumber + 1, useSearchAPI));
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         LOGGER.error("Interrupted while waiting to retry", ie);
                     }
                 } else {
-                    LOGGER.error("Failed to list assets after {} attempts. Giving up on this batch.", attemptNumber, e);
+                    LOGGER.error("Failed to list assets after {} attempts using {}. Giving up on this batch.", 
+                               attemptNumber, useSearchAPI ? "Search API" : "Assets API", e);
                 }
             } catch (Exception e) {
                 if (attemptNumber < MAX_RETRIES) {
@@ -206,13 +249,14 @@ public class DownloadRepository implements Runnable {
                     
                     try {
                         Thread.sleep(delayMs);
-                        executorService.submit(new DownloadAssetsTask(continuationToken, attemptNumber + 1));
+                        executorService.submit(new DownloadAssetsTask(continuationToken, attemptNumber + 1, useSearchAPI));
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         LOGGER.error("Interrupted while waiting to retry", ie);
                     }
                 } else {
-                    LOGGER.error("Failed to list assets after {} attempts with unexpected error. Giving up on this batch.", attemptNumber, e);
+                    LOGGER.error("Failed to list assets after {} attempts with unexpected error using {}. Giving up on this batch.", 
+                               attemptNumber, useSearchAPI ? "Search API" : "Assets API", e);
                 }
             } finally {
                 activeTasks.decrementAndGet();
