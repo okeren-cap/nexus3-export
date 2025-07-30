@@ -46,6 +46,7 @@ public class DownloadRepository implements Runnable {
     private AtomicLong assetProcessed = new AtomicLong();
     private AtomicLong assetFound = new AtomicLong();
     private AtomicInteger activeTasks = new AtomicInteger();
+    private AtomicInteger pendingAssetDiscoveryTasks = new AtomicInteger();
 
     public DownloadRepository(String url, String repositoryId, String downloadPath, boolean authenticate, String username, String password) {
         this.url = requireNonNull(url);
@@ -104,12 +105,22 @@ public class DownloadRepository implements Runnable {
             }
 
             LOGGER.info("Submitting initial task to executor using Search API for better performance.");
+            pendingAssetDiscoveryTasks.incrementAndGet();
             executorService.submit(new DownloadRepository.DownloadAssetsTask(null));
 
+            // Wait for all asset discovery and download tasks to complete
             while (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
-                if (activeTasks.get() == 0) {
-                    LOGGER.info("All download tasks completed. Shutting down executor.");
+                int activeTasks = this.activeTasks.get();
+                int pendingDiscovery = pendingAssetDiscoveryTasks.get();
+                
+                LOGGER.debug("Status check - Active tasks: {}, Pending discovery: {}", activeTasks, pendingDiscovery);
+                
+                // Only shutdown when both asset discovery and download tasks are complete
+                if (activeTasks == 0 && pendingDiscovery == 0) {
+                    LOGGER.info("All asset discovery and download tasks completed. Shutting down executor.");
                     executorService.shutdown();
+                } else if (activeTasks > 0 || pendingDiscovery > 0) {
+                    LOGGER.info("Still processing - Active tasks: {}, Pending discovery: {}", activeTasks, pendingDiscovery);
                 }
             }
 
@@ -130,11 +141,13 @@ public class DownloadRepository implements Runnable {
     public void run() {
         checkState(executorService != null, "Executor not initialized");
         LOGGER.info("Running initial download task using Search API for better performance");
+        pendingAssetDiscoveryTasks.incrementAndGet();
         executorService.submit(new DownloadRepository.DownloadAssetsTask(null));
     }
 
     void notifyProgress() {
-        LOGGER.info("Progress update: Downloaded {} assets out of {} found", assetProcessed.get(), assetFound.get());
+        LOGGER.info("Progress update: Downloaded {} assets out of {} found (Active tasks: {}, Pending discovery: {})", 
+                   assetProcessed.get(), assetFound.get(), activeTasks.get(), pendingAssetDiscoveryTasks.get());
     }
 
     private void createCompletionMarker() {
@@ -177,6 +190,7 @@ public class DownloadRepository implements Runnable {
             this.continuationToken = continuationToken;
             this.attemptNumber = attemptNumber;
             activeTasks.incrementAndGet();
+            // Note: pendingAssetDiscoveryTasks is incremented when the task is submitted, not when created
         }
 
         @Override
@@ -208,6 +222,7 @@ public class DownloadRepository implements Runnable {
                     notifyProgress();
 
                     if (response.getBody().getContinuationToken() != null) {
+                        pendingAssetDiscoveryTasks.incrementAndGet();
                         executorService.submit(new DownloadAssetsTask(response.getBody().getContinuationToken()));
                     }
                 }
@@ -220,6 +235,7 @@ public class DownloadRepository implements Runnable {
                     
                     try {
                         Thread.sleep(delayMs);
+                        pendingAssetDiscoveryTasks.incrementAndGet();
                         executorService.submit(new DownloadAssetsTask(continuationToken, attemptNumber + 1));
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
@@ -237,6 +253,7 @@ public class DownloadRepository implements Runnable {
                     
                     try {
                         Thread.sleep(delayMs);
+                        pendingAssetDiscoveryTasks.incrementAndGet();
                         executorService.submit(new DownloadAssetsTask(continuationToken, attemptNumber + 1));
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
@@ -247,6 +264,7 @@ public class DownloadRepository implements Runnable {
                 }
             } finally {
                 activeTasks.decrementAndGet();
+                pendingAssetDiscoveryTasks.decrementAndGet();
             }
         }
     }
