@@ -4,18 +4,24 @@ package fr.kage.nexus3;
 
 import com.google.common.hash.HashCode;
 import com.google.common.hash.Hashing;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.client.HttpServerErrorException;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.Authenticator;
 import java.net.PasswordAuthentication;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.nio.file.*;
 import java.time.Duration;
@@ -47,6 +53,33 @@ public class DownloadRepository implements Runnable {
     private AtomicLong assetFound = new AtomicLong();
     private AtomicInteger activeTasks = new AtomicInteger();
 
+    private RestTemplate createRestTemplateWithTimeouts(boolean authenticate, String username, String password) {
+        // Create custom HTTP client with explicit timeout settings
+        RequestConfig requestConfig = RequestConfig.custom()
+                .setConnectTimeout(180000) // 3 minutes in milliseconds
+                .setSocketTimeout(900000)  // 15 minutes in milliseconds
+                .setConnectionRequestTimeout(180000) // 3 minutes in milliseconds
+                .build();
+
+        CloseableHttpClient httpClient = HttpClientBuilder.create()
+                .setDefaultRequestConfig(requestConfig)
+                .build();
+
+        HttpComponentsClientHttpRequestFactory requestFactory = new HttpComponentsClientHttpRequestFactory(httpClient);
+        
+        RestTemplate restTemplate = new RestTemplate(requestFactory);
+        
+        if (authenticate) {
+            // For authentication, we'll still use RestTemplateBuilder to handle auth
+            return new RestTemplateBuilder()
+                    .basicAuthentication(username, password)
+                    .requestFactory(() -> requestFactory)
+                    .build();
+        }
+        
+        return restTemplate;
+    }
+
     public DownloadRepository(String url, String repositoryId, String downloadPath, boolean authenticate, String username, String password) {
         this.url = requireNonNull(url);
         this.repositoryId = requireNonNull(repositoryId);
@@ -65,6 +98,8 @@ public class DownloadRepository implements Runnable {
             LOGGER.info("Export Path: {}", downloadPath != null ? downloadPath : "(temporary directory will be created)");
             LOGGER.info("Authentication: {}", authenticate ? "Enabled" : "None");
             LOGGER.info("Username: {}", authenticate ? username : "(n/a)");
+            LOGGER.info("HTTP Client Timeouts: Connect=3min, Socket=15min, Connection Request=3min");
+            LOGGER.info("Retry Configuration: Max attempts=7, Base delay=5s, Queue timeout delay=30s");
             LOGGER.info("========================================================");
 
             LOGGER.info("Preparing download path");
@@ -85,11 +120,7 @@ public class DownloadRepository implements Runnable {
 
             if (authenticate) {
                 LOGGER.info("Authentication enabled. Configuring credentials for REST and stream download.");
-                restTemplate = new RestTemplateBuilder()
-                        .basicAuthentication(username, password)
-                        .setConnectTimeout(Duration.ofMinutes(2))
-                        .setReadTimeout(Duration.ofMinutes(5))
-                        .build();
+                restTemplate = createRestTemplateWithTimeouts(true, username, password);
                 Authenticator.setDefault(new Authenticator() {
                     protected PasswordAuthentication getPasswordAuthentication() {
                         return new PasswordAuthentication(username, password.toCharArray());
@@ -97,10 +128,7 @@ public class DownloadRepository implements Runnable {
                 });
             } else {
                 LOGGER.info("Authentication not required.");
-                restTemplate = new RestTemplateBuilder()
-                        .setConnectTimeout(Duration.ofMinutes(2))
-                        .setReadTimeout(Duration.ofMinutes(5))
-                        .build();
+                restTemplate = createRestTemplateWithTimeouts(false, null, null);
             }
 
             LOGGER.info("Submitting initial task to executor.");
@@ -136,8 +164,9 @@ public class DownloadRepository implements Runnable {
     private class DownloadAssetsTask implements Runnable {
         private final String continuationToken;
         private final int attemptNumber;
-        private static final int MAX_RETRIES = 5;
-        private static final long BASE_DELAY_MS = 2000;
+        private static final int MAX_RETRIES = 7;
+        private static final long BASE_DELAY_MS = 5000;
+        private static final long QUEUE_TIMEOUT_DELAY_MS = 30000; // 30 seconds for queue timeout issues
 
         public DownloadAssetsTask(String continuationToken) {
             this(continuationToken, 1);
@@ -182,10 +211,22 @@ public class DownloadRepository implements Runnable {
                 }
             } catch (HttpServerErrorException e) {
                 if (attemptNumber < MAX_RETRIES && (e.getRawStatusCode() == 500 || e.getRawStatusCode() == 502 || e.getRawStatusCode() == 503)) {
-                    long delayMs = BASE_DELAY_MS * (long) Math.pow(2, attemptNumber - 1);
-                    LOGGER.warn("Attempt {} failed to list/submit download tasks, retrying in {} ms", 
-                              attemptNumber, delayMs);
-                    LOGGER.warn("Error details: {}", e.getMessage());
+                    long delayMs;
+                    
+                    // Check if this is a queue timeout error that needs special handling
+                    if (e.getResponseBodyAsString().contains("timed out reading query result from queue") || 
+                        e.getResponseBodyAsString().contains("queue timeout") ||
+                        e.getRawStatusCode() == 500) {
+                        delayMs = QUEUE_TIMEOUT_DELAY_MS + (BASE_DELAY_MS * attemptNumber);
+                        LOGGER.warn("Attempt {} failed due to server queue timeout (HTTP {}), retrying in {} ms", 
+                                  attemptNumber, e.getRawStatusCode(), delayMs);
+                        LOGGER.warn("Queue timeout error details: {}", e.getResponseBodyAsString());
+                    } else {
+                        delayMs = BASE_DELAY_MS * (long) Math.pow(2, attemptNumber - 1);
+                        LOGGER.warn("Attempt {} failed to list/submit download tasks (HTTP {}), retrying in {} ms", 
+                                  attemptNumber, e.getRawStatusCode(), delayMs);
+                        LOGGER.warn("Error details: {}", e.getMessage());
+                    }
                     
                     try {
                         Thread.sleep(delayMs);
@@ -196,6 +237,26 @@ public class DownloadRepository implements Runnable {
                     }
                 } else {
                     LOGGER.error("Failed to list assets after {} attempts. Giving up on this batch.", attemptNumber, e);
+                }
+            } catch (ResourceAccessException e) {
+                // Handle timeout exceptions specifically
+                if (attemptNumber < MAX_RETRIES && (e.getCause() instanceof SocketTimeoutException || 
+                    e.getMessage().contains("timeout") || e.getMessage().contains("timed out"))) {
+                    
+                    long delayMs = QUEUE_TIMEOUT_DELAY_MS + (BASE_DELAY_MS * attemptNumber);
+                    LOGGER.warn("Attempt {} failed due to timeout, retrying in {} ms", 
+                              attemptNumber, delayMs);
+                    LOGGER.warn("Timeout error details: {}", e.getMessage());
+                    
+                    try {
+                        Thread.sleep(delayMs);
+                        executorService.submit(new DownloadAssetsTask(continuationToken, attemptNumber + 1));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        LOGGER.error("Interrupted while waiting to retry", ie);
+                    }
+                } else {
+                    LOGGER.error("Failed to list assets after {} attempts due to timeout. Giving up on this batch.", attemptNumber, e);
                 }
             } catch (Exception e) {
                 if (attemptNumber < MAX_RETRIES) {
